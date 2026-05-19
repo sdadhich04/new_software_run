@@ -1,0 +1,277 @@
+import sys
+import re
+import serial
+from collections import deque
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+import os
+from datetime import datetime
+
+sys.path.append('/home/tpt-finder/Desktop/brl_data/brl_data')
+import brl_data
+
+"""
+click the rench to build
+click the lightning to flash
+click monitor to open monitor
+x out the terminal with the monitor 
+run the command "source esp32-gui-env/bin/activate" 
+run "python gui_V6.py"
+"""
+
+today = datetime.now().strftime("%Y-%m-%d")
+data_subfolder = os.path.join("data", today)
+os.makedirs(data_subfolder, exist_ok=True)
+
+df = brl_data.datafile(
+    descrip_str="ESP32_Impedance_Monitor",
+    inv_init="TPT",
+    testtype="single"
+)
+
+df.set_folders(
+    datafolder=data_subfolder,
+    gitfolder="."
+)
+
+df.set_metadata(
+    names=["Impedance", "Phase", "Material", "TestTaker"],
+    types=[float, float, str, str],
+    notes=[
+        "Measured impedance magnitude (Ω)",
+        "Measured phase (°)",
+        "Material under test (auto-labeled _1, _2, ... each session)",
+        "Name of test taker (from GUI)"
+    ]
+)
+
+df.open(mode="w")
+
+
+class SerialReader(QtCore.QThread):
+    impedance_received = QtCore.pyqtSignal(float, float)
+
+    def __init__(self, port, baudrate=115200):
+        super().__init__()
+        self.port = port
+        self.baudrate = baudrate
+        self.running = True
+
+    def run(self):
+        try:
+            ser = serial.Serial(self.port, self.baudrate, timeout=1)
+        except Exception as e:
+            print("Failed to open serial port:", e)
+            return
+
+        impedance_pattern = re.compile(r"impedance magnitude: ([0-9]+\.[0-9]+)")
+        phase_pattern = re.compile(r"Calculated phase: (-?[0-9]+\.[0-9]+)")
+
+        impedance = None
+        phase = None
+
+        while self.running:
+            try:
+                if not ser.is_open:
+                    break
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+
+                imp_match = impedance_pattern.search(line)
+                if imp_match:
+                    impedance = float(imp_match.group(1))
+
+                phase_match = phase_pattern.search(line)
+                if phase_match:
+                    phase = float(phase_match.group(1))
+
+                if impedance is not None and phase is not None:
+                    self.impedance_received.emit(impedance, phase)
+                    impedance = None
+                    phase = None
+
+            except Exception as e:
+                print("Serial read error:", e)
+                break
+
+        if ser.is_open:
+            ser.close()
+
+    def stop(self):
+        self.running = False
+        self.wait(1000)
+
+
+class ImpedanceGUI(QtWidgets.QMainWindow):
+    def __init__(self, port):
+        super().__init__()
+        self.setWindowTitle("ESP32 Impedance Monitor")
+        self.resize(600, 550)
+
+        taker_layout = QtWidgets.QHBoxLayout()
+        self.taker_label = QtWidgets.QLabel("Test Taker:")
+        self.taker_input = QtWidgets.QLineEdit()
+        taker_layout.addWidget(self.taker_label)
+        taker_layout.addWidget(self.taker_input)
+
+        material_layout = QtWidgets.QHBoxLayout()
+        self.material_label = QtWidgets.QLabel("Material:")
+        self.material_input = QtWidgets.QLineEdit()
+        material_layout.addWidget(self.material_label)
+        material_layout.addWidget(self.material_input)
+
+        seconds_layout = QtWidgets.QHBoxLayout()
+        self.seconds_label = QtWidgets.QLabel("Record Duration (sec):")
+        self.seconds_input = QtWidgets.QLineEdit()
+        self.seconds_input.setPlaceholderText("e.g. 5")
+        seconds_layout.addWidget(self.seconds_label)
+        seconds_layout.addWidget(self.seconds_input)
+
+        self.label_impedance = QtWidgets.QLabel("Latest Impedance: -- Ω")
+        self.label_impedance.setAlignment(QtCore.Qt.AlignCenter)
+        self.label_impedance.setStyleSheet("font-size: 20px;")
+
+        self.label_phase = QtWidgets.QLabel("Latest Phase: -- °")
+        self.label_phase.setAlignment(QtCore.Qt.AlignCenter)
+        self.label_phase.setStyleSheet("font-size: 16px;")
+
+        self.label_recording = QtWidgets.QLabel("Recording: OFF")
+        self.label_recording.setAlignment(QtCore.Qt.AlignCenter)
+        self.label_recording.setStyleSheet("font-size: 16px; color: red;")
+
+        self.plot_widget = pg.PlotWidget(title="Real-time Impedance Plot")
+        self.plot_widget.setLabel('left', 'Impedance (Ω)')
+        self.plot_widget.setLabel('bottom', 'Sample Index')
+        self.plot_widget.showGrid(x=True, y=True)
+        self.plot_curve = self.plot_widget.plot(pen=pg.mkPen(color='y', width=2))
+        self.plot_data = deque(maxlen=200)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.addLayout(taker_layout)
+        layout.addLayout(material_layout)
+        layout.addLayout(seconds_layout)
+        layout.addWidget(self.label_impedance)
+        layout.addWidget(self.label_phase)
+        layout.addWidget(self.label_recording)
+        layout.addWidget(self.plot_widget)
+
+        self.label_food = QtWidgets.QLabel("Food: --")
+        self.label_food.setAlignment(QtCore.Qt.AlignCenter)
+        self.label_food.setStyleSheet("font-size: 16px;")
+        layout.addWidget(self.label_food)
+
+        central_widget = QtWidgets.QWidget()
+        central_widget.setLayout(layout)
+        self.setCentralWidget(central_widget)
+
+        self.serial_reader = SerialReader(port)
+        self.serial_reader.impedance_received.connect(self.handle_new_data)
+        self.serial_reader.start()
+
+        self.recording = False
+        self.material_counts = {}
+        self.current_material_tag = None
+
+        self.impedance_buffer = []
+        self.phase_buffer = []
+
+        self.stop_timer = QtCore.QTimer()
+        self.stop_timer.timeout.connect(self.stop_recording)
+
+    def handle_new_data(self, impedance, phase):
+        phase = phase - 293.738
+        self.label_impedance.setText(f"Latest Impedance: {impedance:.2f} Ω")
+        self.label_phase.setText(f"Latest Phase: {phase:.2f} °")
+
+        self.plot_data.append(impedance)
+        self.plot_curve.setData(list(self.plot_data))
+
+        if self.recording:
+            self.impedance_buffer.append(impedance)
+            self.phase_buffer.append(phase)
+
+        # Update food label based on impedance thresholds
+        if impedance > 30000:
+            self.label_food.setText("Food: Unknown")
+            self.label_food.setStyleSheet("font-size: 16px; color: gray;")
+        elif impedance > 1000:
+            self.label_food.setText("Food: Pork")
+            self.label_food.setStyleSheet("font-size: 16px; color: red;")
+        elif impedance > 0:
+            self.label_food.setText("Food: Chicken")
+            self.label_food.setStyleSheet("font-size: 16px; color: green;")
+        else:
+            self.label_food.setText("Food: None")
+            self.label_food.setStyleSheet("font-size: 16px; color: black;")
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Space and not self.recording:
+            try:
+                duration = float(self.seconds_input.text())
+            except:
+                print("Invalid seconds input.")
+                return
+
+            base_material = self.material_input.text().strip() or "Unknown"
+
+            if base_material not in self.material_counts:
+                self.material_counts[base_material] = 1
+            else:
+                self.material_counts[base_material] += 1
+
+            count = self.material_counts[base_material]
+            self.current_material_tag = f"{base_material}_{count}"
+
+            test_taker = self.taker_input.text().strip() or "Unknown"
+            df.metadata.d["TestTaker"] = test_taker
+
+            self.impedance_buffer = []
+            self.phase_buffer = []
+
+            self.recording = True
+            self.label_recording.setText(f"Recording: ON ({self.current_material_tag})")
+            self.label_recording.setStyleSheet("font-size: 16px; color: green;")
+
+            print(f"Recording started for {self.current_material_tag} for {duration} seconds")
+
+            self.stop_timer.start(int(duration * 1000))
+
+    def stop_recording(self):
+        self.recording = False
+        self.stop_timer.stop()
+
+        if self.impedance_buffer and self.phase_buffer:
+            avg_impedance = sum(self.impedance_buffer) / len(self.impedance_buffer)
+            avg_phase = sum(self.phase_buffer) / len(self.phase_buffer)
+
+            df.write([
+                avg_impedance,
+                avg_phase,
+                self.current_material_tag,
+                df.metadata.d.get("TestTaker", "Unknown")
+            ])
+
+            print(
+                f"Recorded average for {self.current_material_tag}: "
+                f"{avg_impedance:.2f} Ω, {avg_phase:.2f} ° "
+                f"({len(self.impedance_buffer)} samples)"
+            )
+        else:
+            print("No data collected during recording window.")
+
+        self.label_recording.setText("Recording: OFF")
+        self.label_recording.setStyleSheet("font-size: 16px; color: red;")
+        self.label_food.setText("Food: Pork")
+
+    def closeEvent(self, event):
+        self.serial_reader.stop()
+        df.close()
+        event.accept()
+
+
+if __name__ == "__main__":
+    port = "/dev/ttyACM0"
+
+    app = QtWidgets.QApplication(sys.argv)
+    window = ImpedanceGUI(port)
+    window.show()
+    sys.exit(app.exec_())
